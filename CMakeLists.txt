@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14) # FetchContentには3.11以上、gtestには3.14あたりを推奨
-project(sr_arq LANGUAGES CXX)
+project(srarq LANGUAGES CXX)
 
 # C++標準バージョンの指定 (例: C++17)
 set(CMAKE_CXX_STANDARD 11)

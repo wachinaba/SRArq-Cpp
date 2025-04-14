@@ -5,7 +5,7 @@ add_executable(runUnitTests
 
 # テスト対象のライブラリ (MyLib) と Google Test/Mock にリンク
 target_link_libraries(runUnitTests PRIVATE
-    sr_arq           # 自作ライブラリにリンク
+    srarq           # 自作ライブラリにリンク
     GTest::gtest_main # gtestのmain関数を含むライブラリ (main関数を自分で書かない場合)
     GTest::gmock_main # gmockを使う場合はこちらもリンク (gtest_mainに含まれる場合もある)
 )
