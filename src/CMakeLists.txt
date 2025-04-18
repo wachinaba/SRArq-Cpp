@@ -5,7 +5,7 @@ add_library(srarq INTERFACE)
 #       IDEのプロジェクトビューなどに表示されるようになる
 target_sources(srarq INTERFACE
     # ヘッダファイルが src/include/sr_arq ディレクトリにあると仮定
-    "${CMAKE_CURRENT_SOURCE_DIR}/srarq.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/srarq/srarq.h"
     # "${CMAKE_CURRENT_SOURCE_DIR}/include/sr_arq/your_header2.h"
     # ... 他のヘッダーファイル
     # あるいはディレクトリ丸ごと指定も可能 (ただし非推奨の場合も)
@@ -17,7 +17,7 @@ target_sources(srarq INTERFACE
 # インクルードディレクトリを指定する
 target_include_directories(srarq INTERFACE
     # ヘッダファイルが src/include ディレクトリにあると仮定
-    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/srarq"
 )
 
 target_compile_features(srarq INTERFACE cxx_std_11)
