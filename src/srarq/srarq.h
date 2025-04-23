@@ -317,6 +317,37 @@ class SRArqSender {
     return std::make_pair(true, seq_num);
   }
 
+  std::pair<bool, SequenceNumber> sendBySequenceNumber(
+      SequenceNumber seq_num, const std::vector<uint8_t>& data) {
+    // ロックを取得
+    LockGuard guard(send_buffer_mutex_);
+    // シーケンス番号がスライディングウィンドウを超えている->送信不可
+    if (!SequenceNumberOperations::isNewer(
+            seq_num, SequenceNumberOperations::increment(
+                         sliding_window_start_, sliding_window_length_))) {
+      Logger::log("sendBySequenceNumber: seq_num: " + std::to_string(seq_num) +
+                  " is not in sliding window");
+      return std::make_pair(false, 0);
+    }
+    // シーケンス番号がスライディングウィンドウより前->送信済みとみなす
+    if (!SequenceNumberOperations::isInRange(
+            seq_num, sliding_window_start_,
+            SequenceNumberOperations::increment(sliding_window_start_,
+                                                sliding_window_length_))) {
+      Logger::log("sendBySequenceNumber: seq_num: " + std::to_string(seq_num) +
+                  " is already sent");
+      return std::make_pair(true, seq_num);
+    }
+    // シーケンス番号が送信バッファに存在する->送信済み
+    if (isSequenceNumberHasData(seq_num)) {
+      Logger::log("sendBySequenceNumber: seq_num: " + std::to_string(seq_num) +
+                  " is already sent");
+      return std::make_pair(true, seq_num);
+    }
+    send(seq_num, data);
+    return std::make_pair(true, seq_num);
+  }
+
   /**
    * @brief 受信したAckを処理する
    *
@@ -324,6 +355,7 @@ class SRArqSender {
    * @param is_acked AckかNackか
    */
   void receiveAck(SequenceNumber seq_num, bool is_acked) {
+    bool slided = false;
     {  // ロックを取得
       LockGuard guard(send_buffer_mutex_);
 
@@ -338,16 +370,18 @@ class SRArqSender {
 
       if (is_acked) {
         send_buffer[seq_num]->status = PacketStatus::kAcked;
-        callbacks_->onAck(seq_num, is_acked);
+        auto initial_sliding_window_start = sliding_window_start_;
         slideWindow();
+        slided = initial_sliding_window_start != sliding_window_start_;
       } else {
         send_buffer[seq_num]->status = PacketStatus::kNacked;
-        callbacks_->onAck(seq_num, is_acked);
         send(seq_num, send_buffer[seq_num]->data);
       }
     }  // ロックを解放
 
-    if (is_acked) {
+    callbacks_->onAck(seq_num, is_acked);
+
+    if (is_acked && slided) {
       // スライドウィンドウが空いたことを通知
       callbacks_->onWindowAvailable();
     }
@@ -390,6 +424,11 @@ class SRArqSender {
     packet_transmitter_->transmitData(seq_num, data);
   }
 
+  bool isSequenceNumberHasData(SequenceNumber seq_num) {
+    auto& send_buffer = send_buffer_->getPacketsRef();
+    return send_buffer.find(seq_num) != send_buffer.end();
+  }
+
   /**
    * @brief 空きのシーケンス番号を検索する
    *
@@ -403,7 +442,7 @@ class SRArqSender {
              SequenceNumberOperations::increment(sliding_window_start_,
                                                  sliding_window_length_));
          i = SequenceNumberOperations::increment(i)) {
-      if (send_buffer.find(i) == send_buffer.end()) {
+      if (!isSequenceNumberHasData(i)) {
         return std::make_pair(true, i);
       }
     }
