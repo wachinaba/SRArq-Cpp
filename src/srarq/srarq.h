@@ -543,11 +543,15 @@ class SRArqReceiver {
     virtual ~CallbacksInterface() = default;
 
     virtual void onData(SequenceNumber seq_num) = 0;
+    virtual void onDataOrdered(SequenceNumber seq_num,
+                               std::vector<uint8_t> data) = 0;
   };
 
   class EmptyCallbacks : public CallbacksInterface {
    public:
     void onData(SequenceNumber seq_num) override {}
+    void onDataOrdered(SequenceNumber seq_num,
+                       std::vector<uint8_t> data) override {}
   };
 
   enum class ReceivePacketStatus : uint8_t {
@@ -622,7 +626,6 @@ class SRArqReceiver {
       receive_buffer[seq_num] =
           std::make_shared<ReceivePacket>(data, ReceivePacketStatus::kReceived);
     }  // ロックを解放
-
     // アプリケーションに通知
     callbacks_->onData(seq_num);
   }
@@ -718,7 +721,12 @@ class SRArqReceiver {
          SequenceNumberOperations::isInRange(i, initial_sliding_window_start,
                                              sliding_window_start_);
          i = SequenceNumberOperations::increment(i)) {
-      receive_buffer.erase(i);
+      if (receive_buffer.find(i) != receive_buffer.end()) {
+        // 整列データを通知
+        callbacks_->onDataOrdered(i, receive_buffer[i]->data);
+        // パケットを破棄
+        receive_buffer.erase(i);
+      }
     }
   }
 
