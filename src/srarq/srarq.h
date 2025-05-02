@@ -619,6 +619,7 @@ class SRArqReceiver {
       Mutex mutex)
       : receive_buffer_(receive_buffer),
         packet_transmitter_(packet_transmitter),
+        sliding_window_start_(0),
         sliding_window_length_(sliding_window_length),
         missing_packet_handler_(missing_packet_handler),
         callbacks_(callbacks),
