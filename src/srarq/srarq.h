@@ -639,6 +639,10 @@ class SRArqReceiver {
    */
   void receivePacket(SequenceNumber seq_num, const std::vector<uint8_t>& data) {
     {  // ロックを取得
+      Logger::log("receivePacket: sliding_window_start: " +
+                  std::to_string(sliding_window_start_) +
+                  ", seq_num: " + std::to_string(seq_num));
+
       LockGuard guard(receive_buffer_mutex_);
       auto& receive_buffer = receive_buffer_->getPacketsRef();
       // sliding windowの範囲外のパケットは, Ack済みと判断して破棄
@@ -646,6 +650,8 @@ class SRArqReceiver {
               seq_num, sliding_window_start_,
               SequenceNumberOperations::increment(sliding_window_start_,
                                                   sliding_window_length_))) {
+        Logger::log("receivePacket: seq_num: " + std::to_string(seq_num) +
+                    " is out of range, resend ack");
         // Ack再送
         packet_transmitter_->transmitAck(seq_num);
         return;
@@ -655,6 +661,8 @@ class SRArqReceiver {
       if (receive_buffer.find(seq_num) != receive_buffer.end()) {
         // Acked -> Ack再送
         if (receive_buffer[seq_num]->status == ReceivePacketStatus::kAcked) {
+          Logger::log("receivePacket: seq_num: " + std::to_string(seq_num) +
+                      " is already acked, resend ack");
           packet_transmitter_->transmitAck(seq_num);
           return;
         }
