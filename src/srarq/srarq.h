@@ -16,6 +16,57 @@ struct EmptyLogger {
   static void log(const std::string& message) {}
 };
 
+// Profiling counters for root-cause analysis (shared across all SRArqSender
+// instances)
+struct TimeoutProfiler {
+  static void record_timeout() {
+    // Use function-local statics to avoid multiple definition issues
+    static uint32_t timeout_count_total = 0;
+    static uint32_t timeout_count_last_second = 0;
+    static uint32_t timeout_max_burst_in_tick = 0;
+    static uint32_t timeout_current_tick_burst = 0;
+    static uint32_t last_tick_ms = 0;
+    static uint32_t last_log_ms = 0;
+
+    timeout_count_total++;
+    timeout_count_last_second++;
+
+    // Track burst in same tick (1ms resolution)
+    uint32_t now_ms = 0;
+#ifdef ARDUINO
+    now_ms = millis();
+#else
+    // Fallback if millis() not available
+    now_ms = timeout_count_total;  // Approximate
+#endif
+
+    if (now_ms != last_tick_ms) {
+      // New tick - reset burst counter
+      if (timeout_current_tick_burst > timeout_max_burst_in_tick) {
+        timeout_max_burst_in_tick = timeout_current_tick_burst;
+      }
+      timeout_current_tick_burst = 1;
+      last_tick_ms = now_ms;
+    } else {
+      timeout_current_tick_burst++;
+    }
+
+    // Log periodically (every 5 seconds) or on burst
+    if (now_ms - last_log_ms > 5000 || timeout_current_tick_burst > 10) {
+#ifdef ARDUINO
+      Serial.printf(
+          "SRArqTimeoutProfiler: total=%u, last_sec=%u, max_burst=%u, "
+          "current_burst=%u\n",
+          timeout_count_total, timeout_count_last_second,
+          timeout_max_burst_in_tick, timeout_current_tick_burst);
+      Serial.flush();
+#endif
+      timeout_count_last_second = 0;
+      last_log_ms = now_ms;
+    }
+  }
+};
+
 /*
 Mutex {
   static MutexHandleType create();
@@ -232,7 +283,29 @@ template <typename SequenceNumberType, typename SequenceNumberOperations,
           typename Logger = details::EmptyLogger>
 class SRArqSender {
  public:
-  virtual ~SRArqSender() = default;
+  virtual ~SRArqSender() {
+    // Stop all active timers to prevent callbacks after destruction
+    // This prevents use-after-free when onSendTimeout is called after
+    // the SRArqSender instance is destroyed
+    try {
+      LockGuard guard(send_buffer_mutex_);
+      if (send_buffer_ && timer_) {
+        auto& send_buffer = send_buffer_->getPacketsRef();
+        for (auto& kv : send_buffer) {
+          if (kv.second && kv.second->timer_id) {
+            timer_->stopTimer(kv.second->timer_id);
+            kv.second->timer_id = TimerID{};  // Clear timer_id
+          }
+        }
+        // Clear the send buffer to prevent any further operations
+        send_buffer.clear();
+      }
+      // Invalidate callbacks to prevent any callbacks during destruction
+      callbacks_ = std::make_shared<EmptyCallbacks>();
+    } catch (...) {
+      // Ignore exceptions during destruction (best effort cleanup)
+    }
+  }
 
   using SequenceNumber = SequenceNumberType;
   using TimerID = TimerIDType;
@@ -307,8 +380,24 @@ class SRArqSender {
     LockGuard guard(send_buffer_mutex_);
     auto result = searchAvailableSequenceNumber();
     if (!result.first) {
-      // 空きがない
-      Logger::log("send: no available sequence number");
+      // 空きがない - 内部状態を可視化
+      auto& send_buffer = send_buffer_->getPacketsRef();
+      size_t buffer_size = send_buffer.size();
+      size_t pending_ack_count = 0;
+      size_t timeout_count = 0;
+      size_t nacked_count = 0;
+      for (const auto& kv : send_buffer) {
+        if (kv.second->status == PacketStatus::kSent) pending_ack_count++;
+        if (kv.second->status == PacketStatus::kTimeout) timeout_count++;
+        if (kv.second->status == PacketStatus::kNacked) nacked_count++;
+      }
+      Logger::log("send: no available sequence number | buffer_size=" +
+                  std::to_string(buffer_size) +
+                  " window_start=" + std::to_string(sliding_window_start_) +
+                  " window_len=" + std::to_string(sliding_window_length_) +
+                  " pending_ack=" + std::to_string(pending_ack_count) +
+                  " timeout=" + std::to_string(timeout_count) +
+                  " nacked=" + std::to_string(nacked_count));
       return std::make_pair(false, 0);
     }
     auto seq_num = result.second;
@@ -362,7 +451,8 @@ class SRArqSender {
       auto& send_buffer = send_buffer_->getPacketsRef();
 
       if (send_buffer.find(seq_num) == send_buffer.end()) {
-        // 無効なシーケンス番号のAck
+        Logger::log("receiveAck: seq_num=" + std::to_string(seq_num) +
+                    " not in send_buffer (ignored, may be late or duplicate)");
         return;
       }
 
@@ -375,10 +465,15 @@ class SRArqSender {
         slided = initial_sliding_window_start != sliding_window_start_;
       } else {
         send_buffer[seq_num]->status = PacketStatus::kNacked;
+        Logger::log("receiveAck: Nack seq_num=" + std::to_string(seq_num) +
+                    " retransmitting");
         send(seq_num, send_buffer[seq_num]->data);
       }
     }  // ロックを解放
 
+    Logger::log("receiveAck: seq_num=" + std::to_string(seq_num) +
+                " is_acked=" + (is_acked ? "true" : "false") +
+                (slided ? " window_slided" : ""));
     callbacks_->onAck(seq_num, is_acked);
 
     if (is_acked && slided) {
@@ -455,6 +550,11 @@ class SRArqSender {
    * @param seq_num シーケンス番号
    */
   void onSendTimeout(SequenceNumber seq_num) {
+// Profiling: record timeout for root-cause analysis
+#ifdef ARDUINO
+    details::TimeoutProfiler::record_timeout();
+#endif
+
     Logger::log("onSendTimeout: seq_num: " + std::to_string(seq_num));
 
     std::shared_ptr<SendPacket> send_packet;
@@ -673,6 +773,8 @@ class SRArqReceiver {
       // データを更新
       receive_buffer[seq_num] =
           std::make_shared<ReceivePacket>(data, ReceivePacketStatus::kReceived);
+      Logger::log("receivePacket: new Data seq_num=" + std::to_string(seq_num) +
+                  " data_size=" + std::to_string(data.size()));
     }  // ロックを解放
     // アプリケーションに通知
     callbacks_->onData(seq_num);
@@ -724,12 +826,20 @@ class SRArqReceiver {
       }
     }  // ロックを解放
 
-    Logger::log("sendAck: seq_num: " + std::to_string(seq_num) +
-                ", is_acked: " + std::to_string(is_acked));
-    Logger::log("sliding_window_start: " +
-                std::to_string(sliding_window_start_));
-    Logger::log("out_of_order_packets: " +
-                std::to_string(out_of_order_packets.size()));
+    Logger::log(
+        "sendAck: seq_num=" + std::to_string(seq_num) +
+        " is_acked=" + std::to_string(is_acked) +
+        " sliding_window_start=" + std::to_string(sliding_window_start_) +
+        " out_of_order_count=" + std::to_string(out_of_order_packets.size()));
+    if (!out_of_order_packets.empty()) {
+      std::string missing_list;
+      for (size_t i = 0; i < out_of_order_packets.size(); ++i) {
+        if (i > 0) missing_list += ",";
+        missing_list += std::to_string(out_of_order_packets[i]);
+      }
+      Logger::log("sendAck: requesting Nack for missing seq_nums: " +
+                  missing_list);
+    }
     missing_packet_handler_->onMissingPackets(out_of_order_packets);
   }
 
