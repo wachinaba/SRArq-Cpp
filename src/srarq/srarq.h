@@ -287,6 +287,7 @@ class SRArqSender {
     // Stop all active timers to prevent callbacks after destruction
     // This prevents use-after-free when onSendTimeout is called after
     // the SRArqSender instance is destroyed
+    clearLifetimeGuard();
     try {
       LockGuard guard(send_buffer_mutex_);
       if (send_buffer_ && timer_) {
@@ -368,6 +369,14 @@ class SRArqSender {
         sliding_window_length_(sliding_window_length),
         callbacks_(callbacks),
         send_buffer_mutex_(mutex) {}
+
+  /** Guard timer callbacks: skip if owner (e.g. SenderSession) was destroyed. */
+  template <typename Owner>
+  void setLifetimeGuard(const std::shared_ptr<Owner>& owner) {
+    lifetime_guard_ = owner;
+  }
+
+  void clearLifetimeGuard() { lifetime_guard_.reset(); }
 
   /**
    * @brief データを送信する
@@ -490,10 +499,16 @@ class SRArqSender {
    * @param data 送信するデータ
    */
   void send(SequenceNumber seq_num, const std::vector<uint8_t>& data) {
-    // 再送タイマーを設定
+    // 再送タイマーを設定（session GC 後の queued callback を weak guard で無効化）
+    std::weak_ptr<void> guard = lifetime_guard_;
     auto timer_id = timer_->startTimer(
         timeout_strategy_->getTimeout(seq_num),
-        std::bind(&SRArqSender::onSendTimeout, this, seq_num));
+        [guard, this, seq_num]() {
+          if (!guard.lock()) {
+            return;
+          }
+          onSendTimeout(seq_num);
+        });
     // 送信バッファに追加
     auto& send_buffer = send_buffer_->getPacketsRef();
 
@@ -621,6 +636,7 @@ class SRArqSender {
 
   std::shared_ptr<CallbacksInterface> callbacks_;
 
+  std::weak_ptr<void> lifetime_guard_;
   Mutex send_buffer_mutex_;
 };
 
